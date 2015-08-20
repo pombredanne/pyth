@@ -13,7 +13,7 @@ from pyth.format import PythReader
 from pyth.encodings import symbol
 
 _CONTROLCHARS = set(string.ascii_letters + string.digits + "-*")
-_DIGITS = set(string.digits)
+_DIGITS = set(string.digits + "-")
 
 
 _CODEPAGES = {
@@ -56,17 +56,17 @@ _CODEPAGES = {
     255: "cp850",  # OEM
 }
 
-# All the ones named by number in my 2.6 encodings dir
+# All the ones named by number in my 2.6 encodings dir, and those listed above
 _CODEPAGES_BY_NUMBER = dict(
-    (x, "cp%s" % x) for x in (37, 1006, 1026, 1140, 1250, 1251, 1252, 1253, 1254, 1255,
-                              1256, 1257, 1258, 424, 437, 500, 737, 775, 850, 852, 855,
-                              856, 857, 860, 861, 862, 863, 864, 865, 866, 869, 874,
-                              875, 932, 949, 950))
+    (x, "cp%s" % x) for x in (37, 424, 437, 500, 737, 775, 850, 852, 855, 856, 
+                              857, 860, 861, 862, 863, 864, 865, 866, 869, 874,
+                              875, 932, 936, 949, 950, 1006, 1026, 1140, 1250, 
+                              1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258, 1361))
 
 # Miscellaneous, incomplete
 _CODEPAGES_BY_NUMBER.update({
-   10000: "mac-roman",
-   10007: "mac-greek",
+    10000: "mac-roman",
+    10007: "mac-greek"
 })
 
 
@@ -123,6 +123,7 @@ class Rtf15Reader(PythReader):
                 subGroup = Group(self, self.group, self.charsetTable)
                 self.stack.append(subGroup)
                 subGroup.skip = self.group.skip
+                self.group.flushChars()
                 self.group = subGroup
             elif next == '}':
                 subGroup = self.stack.pop()
@@ -213,6 +214,7 @@ class DocBuilder(object):
         self.propStack = [{}]
         self.block = None
 
+        self.isImage = False
         self.listLevel = None
         self.listStack = [doc]
 
@@ -222,10 +224,16 @@ class DocBuilder(object):
     def flushRun(self):
         if self.block is None:
             self.block = document.Paragraph()
-
-        self.block.content.append(
-            document.Text(self.propStack[-1].copy(),
-                          [u"".join(self.run)]))
+        
+        if self.isImage:
+            self.block.content.append(
+                document.Image(self.propStack[-1].copy(),
+                               [str("".join(self.run))]))
+            self.isImage = False
+        else:
+            self.block.content.append(
+                document.Text(self.propStack[-1].copy(),
+                              [u"".join(self.run)]))
 
         self.run[:] = []
 
@@ -313,7 +321,10 @@ class DocBuilder(object):
             self.listStack[-1].append(l)
 
         self.block = None
-
+    
+    def handle_Pict(self, pict):
+        self.flushRun()
+        self.isImage = True
 
     def handle_Reset(self, _):
         self.flushRun()
@@ -334,6 +345,16 @@ class DocBuilder(object):
             if marker.name in self.propStack[-1]:
                 del self.propStack[-1][marker.name]
 
+    def handle_ImageMarker(self, marker):
+        if marker.val:
+            self.propStack[-1][marker.name] = marker.val
+        else:
+            if marker.name in self.propStack[-1]:
+                # Is there any toggle that is applied to images?
+                del self.propStack[-1][marker.name]
+            else:
+                self.propStack[-1][marker.name] = True
+    
 
 
 class Group(object):
@@ -348,22 +369,42 @@ class Group(object):
         else:
             self.props = {}
             self.charset = self.reader.charset
+        self.isPcData = False
 
         self.specialMeaning = None
         self.skip = False
         self.url = None
+        self.image = None
         self.currentParaTag = None
         self.destination = False
 
         self.charsetTable = charsetTable
 
         self.content = []
+        self.charBuffer = []
+        self.skipCount = 0
+
+
+    def flushChars(self):
+        chars = "".join(self.charBuffer).decode(self.charset, self.reader.errors)
+        self.content.append(chars)
+        self.charBuffer = []
 
 
     def handle(self, control, digits):
+        if self.charBuffer and control != "ansi_escape":
+            self.flushChars()
 
         if control == '*':
             self.destination = True
+            return
+        
+        if self.image and control in ['emfblip', 'pngblip', 'jpegblip', 'macpict', 'pmmetafile', 'wmetafile', 
+                                      'dibitmap', 'wbitmap', 'wbmbitspixel', 'wbmplanes', 'wbmwidthbytes', 
+                                      'picw', 'pich', 'picwgoal', 'pichgoal', 'picscalex', 'picscaley', 
+                                      'picscaled', 'piccropt', 'piccropb', 'piccropr', 'piccropl', 'picbmp', 
+                                      'picbpp', 'bin', 'blipupi', 'blipuid', 'bliptag', 'wbitmap']:
+            self.content.append(ImageMarker(control, digits))
             return
 
         handler = getattr(self, 'handle_%s' % control, None)
@@ -376,8 +417,11 @@ class Group(object):
             handler()
 
 
-    def char(self, char):
-        self.content.append(char.decode(self.charset, self.reader.errors))
+    def char(self, byte):
+        if self.skipCount:
+            self.skipCount -= 1
+        else:
+            self.charBuffer.append(byte)
 
 
     def _finalize(self):
@@ -391,17 +435,7 @@ class Group(object):
         if self.skip:
             return
 
-        stuff = []
-        i = 0
-        while i < len(self.content):
-            thing = self.content[i]
-            if isinstance(thing, Skip):
-                i += thing.count
-            else:
-                stuff.append(thing)
-            i += 1
-
-        self.content = stuff
+        self.flushChars()
 
 
     # This is only the default,
@@ -442,6 +476,13 @@ class Group(object):
         self.specialMeaning = 'FONT_TABLE'
         self.charsetTable = {}
 
+    def handle_falt(self):
+        self.specialMeaning = 'FONT_ALT_NAME'
+        self.isPcData = True
+
+    def handle_fname(self):
+        self.specialMeaning = 'NON_TAGGED_NAME'
+        self.isPcData = True
 
     def _setFontCharset(self, charset=None):
         if charset is None:
@@ -457,8 +498,16 @@ class Group(object):
         if 'FONT_TABLE' in (self.parent.specialMeaning, self.specialMeaning):
             self.fontNum = int(fontNum)
             self._setFontCharset()
+            self.isPcData = True
         elif self.charsetTable is not None:
-            self.charset = self.charsetTable[int(fontNum)]
+            try:
+                self.charset = self.charsetTable[int(fontNum)]
+            except KeyError:
+                # fontNum not found in charsetTable, ignore if requested
+                if self.reader.errors == 'ignore':
+                    pass
+                else:
+                    raise
 
     def handle_fcharset(self, charsetNum):
         if 'FONT_TABLE' in (self.parent.specialMeaning, self.specialMeaning):
@@ -483,7 +532,10 @@ class Group(object):
                 char = unichr(uni_code)
 
         else:
-            char = chr(code).decode(self.charset, self.reader.errors)
+            char = chr(code)
+            if not self.isPcData:
+                self.char(char)
+                return
 
         self.content.append(char)
 
@@ -496,8 +548,8 @@ class Group(object):
 
     def handle_u(self, codepoint):
         codepoint = int(codepoint)
-        try: 
-            char = unichr(codepoint)
+        try:
+            char = unichr(codepoint % 2**16)
         except ValueError:
             if self.reader.errors == 'replace':
                 char = '?'
@@ -505,7 +557,10 @@ class Group(object):
                 raise
 
         self.content.append(char)
-        self.content.append(Skip(self.props.get('unicode_skip', 1)))
+        self.skipCount = self.props.get('unicode_skip', 1)
+
+    def handle_uc(self, skipBytes):
+        self.props['unicode_skip'] = int(skipBytes)
 
 
     def handle_par(self):
@@ -541,6 +596,11 @@ class Group(object):
         self.content.append(ReadableMarker("underline", val))
 
 
+    def handle_strike(self, onOff=None):
+        val = onOff in (None, "", "1")
+        self.content.append(ReadableMarker("strike", val))
+
+
     def handle_ilvl(self, level):
         if self.currentParaTag is not None:
             self.currentParaTag.listLevel = level
@@ -555,6 +615,11 @@ class Group(object):
 
     def handle_super(self):
         self.content.append(ReadableMarker("super", True))
+
+    #Turns off superscripting or subscripting
+    def handle_nosupersub(self):
+        self.content.append(ReadableMarker("sub", False))
+        self.content.append(ReadableMarker("super", False))
 
     def handle_dn(self, amount):
         self.content.append(ReadableMarker("sub", True))
@@ -580,7 +645,20 @@ class Group(object):
     def handle_rdblquote(self):
         self.content.append(u'\u201D')
 
+    def handle_tab(self):
+        self.content.append(u'\t')
 
+    def handle_trowd(self):
+        self.content.append(u'\n')
+        
+    #Handle the image tag
+    def handle_pict(self):
+        p = Pict()
+        self.content.append(p)
+        self.image = p
+        #Remove the destination control group of the parent, so that the image is preserved
+        self.parent.destination = False
+    
     def handle_field(self):
         def finalize():
             if len(self.content) != 2:
@@ -646,12 +724,6 @@ class Group(object):
 
 
 
-
-class Skip(object):
-    def __init__(self, count):
-        self.count = count
-
-
 class ReadableMarker(object):
     def __init__(self, name=None, val=None):
         if name is not None:
@@ -664,7 +736,16 @@ class ReadableMarker(object):
         else:
             return "!%s::%s!" % (self.name, self.val)
 
+class ImageMarker(ReadableMarker):
+    pass
 
+class Pict(ImageMarker):
+    def __init__(self):
+        ImageMarker.__init__(self, "Pict")
+
+    def __repr__(self):
+        return "!Image!"
+            
 class Para(ReadableMarker):
     listLevel = None
 

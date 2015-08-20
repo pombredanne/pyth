@@ -12,14 +12,15 @@ from pyth.plugins.xhtml.css import CSS
 class XHTMLReader(PythReader):
 
     @classmethod
-    def read(self, source, css_source=None, encoding="utf-8"):
-        reader = XHTMLReader(source, css_source, encoding)
+    def read(self, source, css_source=None, encoding="utf-8", link_callback=None):
+        reader = XHTMLReader(source, css_source, encoding, link_callback)
         return reader.go()
 
-    def __init__(self, source, css_source=None, encoding="utf-8"):
+    def __init__(self, source, css_source=None, encoding="utf-8", link_callback=None):
         self.source = source
         self.css_source = css_source
         self.encoding = encoding
+        self.link_callback = link_callback
 
     def go(self):
         soup = BeautifulSoup.BeautifulSoup(self.source,
@@ -55,7 +56,7 @@ class XHTMLReader(PythReader):
                 text = unicode(node)
                 lines = [x.strip() for x in text.splitlines()]
                 text = ' '.join(lines)
-                node.replaceWith(text)
+                node.replaceWith(BeautifulSoup.BeautifulSoup(text))
         soup = BeautifulSoup.BeautifulSoup(unicode(soup))
         # replace all <br/> tag by newline character
         for node in soup.findAll('br'):
@@ -103,7 +104,11 @@ class XHTMLReader(PythReader):
         a_node = node.findParent('a')
         if not a_node:
             return None
-        return a_node.get('href')
+
+        if self.link_callback is None:
+            return a_node.get('href')
+        else:
+            return self.link_callback(a_node.get('href'))
 
     def process_text(self, node):
         """
